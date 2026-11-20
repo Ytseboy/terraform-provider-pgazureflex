@@ -1,0 +1,17 @@
+# Built provider binary & release artifacts
+terraform-provider-pgazureflex
+terraform-provider-pgazureflex_v*
+dist/
+
+# Lean 4 build cache
+formal/.lake/
+
+# Terraform local state & plugin caches
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+
+# OS / Editor
+.DS_Store
+*.swp

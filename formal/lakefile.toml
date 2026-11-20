@@ -1,0 +1,6 @@
+name = "pgazureflex_formal"
+version = "0.1.0"
+defaultTargets = ["PgAzureFlex"]
+
+[[lean_lib]]
+name = "PgAzureFlex"

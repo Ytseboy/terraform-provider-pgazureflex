@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vet & Unit Tests (including Mock Azure APIs)
+        run: go vet ./... && make test
+      - name: Live PostgreSQL 16 + Mock Azure E2E Integration Tests
+        run: make test-integration
+      - name: Build Binary
+        run: make build
+
+  lean-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lean 4 Formal Proof Verification
+        run: make verify-lean
