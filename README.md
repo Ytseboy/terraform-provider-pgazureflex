@@ -23,17 +23,19 @@ A modern **Terraform Plugin Framework (Protocol v6)** provider for PostgreSQL bu
 - [Guide: Microsoft Entra ID Authentication](docs/guides/azure-entra-id-authentication.md) — Workload Identity, Managed Identity, Private VNet, Sovereign Clouds
 - [Guide: Production Multi-Tenant RBAC](docs/guides/production-multi-tenant-rbac.md) — 5-tier per-tenant RBAC, PG 16+ ownership, zero-downtime migration
 
-### Resources (10)
+### Resources (12)
 | Resource | Documentation | Purpose |
 |---|---|---|
 | `pgazureflex_database` | [database.md](docs/resources/database.md) | Databases, ownership, in-place rename, `ALTER DATABASE SET`, `force_drop` |
+| `pgazureflex_database_config` | [database_config.md](docs/resources/database_config.md) | Non-destructive ownership, `PUBLIC` hardening & parameters on `azurerm`-managed DBs |
 | `pgazureflex_role` | [role.md](docs/resources/role.md) | Native login & `NOLOGIN` RBAC roles, parameters, `reassign_owned_to` / `drop_owned` |
+| `pgazureflex_role_database_parameters` | [role_database_parameters.md](docs/resources/role_database_parameters.md) | Per-role, per-database parameters (`ALTER ROLE ... IN DATABASE ... SET`, e.g. `pgaudit.log`) |
 | `pgazureflex_entra_role` | [entra_role.md](docs/resources/entra_role.md) | Microsoft Entra ID principals via `pgaadauth_create_principal_with_oid` |
 | `pgazureflex_entra_role_mapping` | [entra_role_mapping.md](docs/resources/entra_role_mapping.md) | Bind Entra OID onto existing PG role via `SECURITY LABEL FOR "pgaadauth"` (in-place rotation) |
 | `pgazureflex_role_membership` | [role_membership.md](docs/resources/role_membership.md) | Standalone `GRANT <role> TO <member_role>` with PG 16+ `ADMIN`/`INHERIT`/`SET` |
 | `pgazureflex_schema` | [schema.md](docs/resources/schema.md) | Schemas, ownership, in-place rename, `revoke_public_create` |
 | `pgazureflex_extension` | [extension.md](docs/resources/extension.md) | Extensions with Azure `azure.extensions` allowlist diagnostics |
-| `pgazureflex_grant` | [grant.md](docs/resources/grant.md) | Declarative grants with live `aclexplode` drift detection |
+| `pgazureflex_grant` | [grant.md](docs/resources/grant.md) | Declarative & authoritative (`privileges = []` / `authoritative = true`) grants with `aclexplode` drift detection |
 | `pgazureflex_default_privileges` | [default_privileges.md](docs/resources/default_privileges.md) | `ALTER DEFAULT PRIVILEGES FOR ROLE ... IN SCHEMA ...` |
 | `pgazureflex_publication` | [publication.md](docs/resources/publication.md) | Logical replication publications for CDC & migrations |
 

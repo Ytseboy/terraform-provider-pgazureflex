@@ -157,4 +157,26 @@ theorem revoke_after_grant_disjoint (acl : ACL) (ps : List CanonPriv)
   · simp [revokeACL, grantACL, h, hdisj p h]
   · simp [revokeACL, grantACL, h]
 
+/-- Authoritative grant (`authoritative = true` or `privileges = []`):
+    revokes every valid privilege for `ot` NOT in `desired`, then grants `desired`. -/
+def authoritativeGrantACL (ot : ObjectType) (acl : ACL) (desired : List CanonPriv) : ACL :=
+  let toRevoke := (validPrivileges ot).filter (fun p => !(p ∈ desired))
+  grantACL (revokeACL acl toRevoke) desired
+
+/-- Theorem 8 (Authoritative PUBLIC Revocation): Setting `desired = []` removes EVERY
+    valid privilege for `ot` from the ACL (e.g. `CONNECT`, `TEMPORARY`, `CREATE` from `PUBLIC`). -/
+theorem authoritative_empty_revokes_all_valid (ot : ObjectType) (acl : ACL) (p : CanonPriv)
+    (hp : p ∈ validPrivileges ot) :
+    authoritativeGrantACL ot acl [] p = false := by
+  simp [authoritativeGrantACL, grantACL, revokeACL, hp]
+
+/-- Theorem 9 (Authoritative Exactness): For any valid privilege `p ∈ validPrivileges ot`,
+    `authoritativeGrantACL ot acl desired p = true` iff `p ∈ desired`. -/
+theorem authoritative_exact_on_valid (ot : ObjectType) (acl : ACL) (desired : List CanonPriv)
+    (p : CanonPriv) (hp : p ∈ validPrivileges ot) :
+    authoritativeGrantACL ot acl desired p = (p ∈ desired) := by
+  by_cases hd : p ∈ desired
+  · simp [authoritativeGrantACL, grantACL, revokeACL, hp, hd]
+  · simp [authoritativeGrantACL, grantACL, revokeACL, hp, hd]
+
 end PgAzureFlex.Privileges

@@ -139,6 +139,14 @@ func TestProviderHelpersAndSQLBuilders(t *testing.T) {
 		t.Fatalf("quoteTableRef = %q", got)
 	}
 
+	// quoteParameterName (standard & dot-qualified extension GUCs)
+	if got := quoteParameterName("statement_timeout"); got != `"statement_timeout"` {
+		t.Fatalf("quoteParameterName(std) = %q", got)
+	}
+	if got := quoteParameterName("pgaudit.log"); got != `"pgaudit"."log"` {
+		t.Fatalf("quoteParameterName(dotted) = %q", got)
+	}
+
 	// defaultACL helpers
 	if p, err := defaultACLPlural("sequence"); err != nil || p != "SEQUENCES" {
 		t.Fatalf("defaultACLPlural = %q, %v", p, err)

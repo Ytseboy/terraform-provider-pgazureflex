@@ -167,11 +167,21 @@ func readRoleMemberships(ctx context.Context, pool *pgxpool.Pool, roleName strin
 	return roles, rows.Err()
 }
 
+// quoteParameterName safely quotes PostgreSQL GUC parameter names, including dot-qualified
+// extension parameters such as `pgaudit.log` -> `"pgaudit"."log"`.
+func quoteParameterName(param string) string {
+	parts := strings.Split(param, ".")
+	if len(parts) > 1 {
+		return pgclient.QuoteQualifiedIdent(parts...)
+	}
+	return pgclient.QuoteIdent(param)
+}
+
 // syncEntityParameters applies ALTER <ENTITY> <name> SET / RESET for desired vs current parameters.
 func syncEntityParameters(ctx context.Context, pool *pgxpool.Pool, entityKeyword, entityName string, desired, current map[string]string) error {
 	for k := range current {
 		if _, keep := desired[k]; !keep {
-			sql := fmt.Sprintf("ALTER %s %s RESET %s", entityKeyword, pgclient.QuoteIdent(entityName), pgclient.QuoteIdent(k))
+			sql := fmt.Sprintf("ALTER %s %s RESET %s", entityKeyword, pgclient.QuoteIdent(entityName), quoteParameterName(k))
 			if err := pgclient.RetryTransient(ctx, func() error {
 				_, execErr := pool.Exec(ctx, sql)
 				return execErr
@@ -188,7 +198,7 @@ func syncEntityParameters(ctx context.Context, pool *pgxpool.Pool, entityKeyword
 		sql := fmt.Sprintf("ALTER %s %s SET %s = %s",
 			entityKeyword,
 			pgclient.QuoteIdent(entityName),
-			pgclient.QuoteIdent(k),
+			quoteParameterName(k),
 			pgclient.QuoteLiteral(v),
 		)
 		if err := pgclient.RetryTransient(ctx, func() error {

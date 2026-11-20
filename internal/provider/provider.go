@@ -278,7 +278,9 @@ func (p *PGAzureFlexProvider) Configure(ctx context.Context, req provider.Config
 func (p *PGAzureFlexProvider) Resources(_ context.Context) []func() resource.Resource {
 	return []func() resource.Resource{
 		NewDatabaseResource,
+		NewDatabaseConfigResource,
 		NewRoleResource,
+		NewRoleDatabaseParametersResource,
 		NewEntraRoleResource,
 		NewEntraRoleMappingResource,
 		NewRoleMembershipResource,

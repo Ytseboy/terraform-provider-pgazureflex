@@ -329,6 +329,104 @@ func TestLifecyclePlanIdempotencyImportDeleteEndToEnd(t *testing.T) {
 		"all_tables": tftypes.NewValue(tftypes.Bool, false),
 	}, true)
 
+	// --- 10b. pgazureflex_database_config: non-destructive ownership transfer + PUBLIC revocation + parameters ---
+	// Simulate an externally created database (like azurerm_postgresql_flexible_server_database)
+	if _, err := pgPool.Exec(ctx, `CREATE DATABASE lc_ext_db`); err != nil {
+		t.Fatalf("create external test db: %v", err)
+	}
+	defer func() {
+		verifyClient.CloseDatabasePool("lc_ext_db")
+		_, _ = pgPool.Exec(context.Background(), `DROP DATABASE IF EXISTS lc_ext_db WITH (FORCE)`)
+	}()
+
+	dbCfgResCfg := map[string]tftypes.Value{
+		"database":             tftypes.NewValue(tftypes.String, "lc_ext_db"),
+		"owner":                tftypes.NewValue(tftypes.String, "lc_role_renamed"),
+		"revoke_public_access": tftypes.NewValue(tftypes.Bool, true),
+		"connection_limit":     tftypes.NewValue(tftypes.Number, int64(50)),
+		"parameters": tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, map[string]tftypes.Value{
+			"work_mem": tftypes.NewValue(tftypes.String, "8MB"),
+		}),
+	}
+	dbCfgState := applyStrict(t, srv, schemaResp, "pgazureflex_database_config", tftypes.Value{}, dbCfgResCfg)
+	dbCfgState = assertIdempotentPlan(t, srv, schemaResp, "pgazureflex_database_config", dbCfgState, dbCfgResCfg)
+	assertImportAndIdempotentPlan(t, srv, schemaResp, "pgazureflex_database_config", "lc_ext_db", dbCfgResCfg)
+
+	// Verify PUBLIC has 0 privileges on lc_ext_db in pg_database ACL
+	var extPubPrivs int
+	_ = pgPool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM pg_database d
+		CROSS JOIN LATERAL aclexplode(COALESCE(d.datacl, acldefault('d', d.datdba))) a
+		WHERE d.datname = 'lc_ext_db' AND a.grantee = 0
+	`).Scan(&extPubPrivs)
+	if extPubPrivs != 0 {
+		t.Fatalf("expected 0 PUBLIC privileges on lc_ext_db after revoke_public_access=true, got %d", extPubPrivs)
+	}
+
+	// --- 10c. pgazureflex_grant authoritative PUBLIC revocation (privileges = [] and authoritative = true) ---
+	pubRevokeCfg := map[string]tftypes.Value{
+		"database":    tftypes.NewValue(tftypes.String, "lc_db_renamed"),
+		"role":        tftypes.NewValue(tftypes.String, "PUBLIC"),
+		"object_type": tftypes.NewValue(tftypes.String, "database"),
+		"privileges":  tftypes.NewValue(tftypes.Set{ElementType: tftypes.String}, []tftypes.Value{}),
+	}
+	pubRevokeState := applyStrict(t, srv, schemaResp, "pgazureflex_grant", tftypes.Value{}, pubRevokeCfg)
+	pubRevokeState = assertIdempotentPlan(t, srv, schemaResp, "pgazureflex_grant", pubRevokeState, pubRevokeCfg)
+
+	schemaAuthCfg := map[string]tftypes.Value{
+		"database":      tftypes.NewValue(tftypes.String, "lc_db_renamed"),
+		"role":          tftypes.NewValue(tftypes.String, "PUBLIC"),
+		"object_type":   tftypes.NewValue(tftypes.String, "schema"),
+		"schema":        tftypes.NewValue(tftypes.String, "public"),
+		"authoritative": tftypes.NewValue(tftypes.Bool, true),
+		"privileges": tftypes.NewValue(tftypes.Set{ElementType: tftypes.String}, []tftypes.Value{
+			tftypes.NewValue(tftypes.String, "USAGE"),
+		}),
+	}
+	schemaAuthState := applyStrict(t, srv, schemaResp, "pgazureflex_grant", tftypes.Value{}, schemaAuthCfg)
+	schemaAuthState = assertIdempotentPlan(t, srv, schemaResp, "pgazureflex_grant", schemaAuthState, schemaAuthCfg)
+
+	// --- 10d. pgazureflex_role_database_parameters (standard + dotted extension GUC `pgaudit.log`) ---
+	rdbParamsCfg1 := map[string]tftypes.Value{
+		"database": tftypes.NewValue(tftypes.String, "lc_ext_db"),
+		"role":     tftypes.NewValue(tftypes.String, "lc_mi_principal"),
+		"parameters": tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, map[string]tftypes.Value{
+			"pgaudit.log":                   tftypes.NewValue(tftypes.String, "write, ddl, role"),
+			"statement_timeout":             tftypes.NewValue(tftypes.String, "15s"),
+			"default_transaction_read_only": tftypes.NewValue(tftypes.String, "on"),
+		}),
+	}
+	rdbParamsState := applyStrict(t, srv, schemaResp, "pgazureflex_role_database_parameters", tftypes.Value{}, rdbParamsCfg1)
+	rdbParamsState = assertIdempotentPlan(t, srv, schemaResp, "pgazureflex_role_database_parameters", rdbParamsState, rdbParamsCfg1)
+	assertImportAndIdempotentPlan(t, srv, schemaResp, "pgazureflex_role_database_parameters", "lc_ext_db:lc_mi_principal", rdbParamsCfg1)
+
+	// Update role-in-database parameters in-place
+	rdbParamsCfg2 := map[string]tftypes.Value{
+		"database": tftypes.NewValue(tftypes.String, "lc_ext_db"),
+		"role":     tftypes.NewValue(tftypes.String, "lc_mi_principal"),
+		"parameters": tftypes.NewValue(tftypes.Map{ElementType: tftypes.String}, map[string]tftypes.Value{
+			"pgaudit.log":       tftypes.NewValue(tftypes.String, "write, ddl"),
+			"statement_timeout": tftypes.NewValue(tftypes.String, "30s"),
+		}),
+	}
+	assertPlanReplace(t, srv, schemaResp, "pgazureflex_role_database_parameters", rdbParamsState, rdbParamsCfg2, false)
+	rdbParamsState = applyStrict(t, srv, schemaResp, "pgazureflex_role_database_parameters", rdbParamsState, rdbParamsCfg2)
+	rdbParamsState = assertIdempotentPlan(t, srv, schemaResp, "pgazureflex_role_database_parameters", rdbParamsState, rdbParamsCfg2)
+
+	// Destroy pgazureflex_role_database_parameters & pgazureflex_database_config:
+	// Verify parameters reset AND external DB `lc_ext_db` SURVIVES non-destructive destroy!
+	applyStrict(t, srv, schemaResp, "pgazureflex_role_database_parameters", rdbParamsState, nil)
+	applyStrict(t, srv, schemaResp, "pgazureflex_database_config", dbCfgState, nil)
+	var extDBStillExists bool
+	_ = pgPool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'lc_ext_db')`).Scan(&extDBStillExists)
+	if !extDBStillExists {
+		t.Fatal("expected external database lc_ext_db to survive non-destructive pgazureflex_database_config destroy")
+	}
+	// Transfer lc_ext_db back to superuser before dropping lc_role_renamed at test end
+	_, _ = pgPool.Exec(ctx, `ALTER DATABASE lc_ext_db OWNER TO postgres`)
+	applyStrict(t, srv, schemaResp, "pgazureflex_grant", schemaAuthState, nil)
+	applyStrict(t, srv, schemaResp, "pgazureflex_grant", pubRevokeState, nil)
+
 	// --- 11. Invalid Import ID Error Diagnostics ---
 	invalidImports := []struct {
 		typeName string

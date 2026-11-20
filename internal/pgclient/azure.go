@@ -19,23 +19,33 @@ type EntraPrincipal struct {
 }
 
 // WithRoleMembership executes fn while ensuring the connecting user holds membership in targetRole.
-//
-// On Azure Database for PostgreSQL Flexible Server, the server admin is a member of `azure_pg_admin`
-// rather than a true PostgreSQL SUPERUSER. Operations like:
-//   - ALTER DATABASE ... OWNER TO target_role
-//   - CREATE SCHEMA ... AUTHORIZATION target_role
-//   - ALTER DEFAULT PRIVILEGES FOR ROLE target_role ...
-// require the current user to be a member of `target_role` (especially strict on PG 16+).
-//
-// If the current user is not a superuser and not already a direct member of targetRole, this helper
-// grants temporary membership, executes fn, and cleanly revokes it afterward.
 func (c *Client) WithRoleMembership(ctx context.Context, database, targetRole string, fn func(pool *pgxpool.Pool) error) error {
+	if targetRole == "" {
+		pool, err := c.Pool(ctx, database)
+		if err != nil {
+			return err
+		}
+		return fn(pool)
+	}
+	return c.WithRoleMemberships(ctx, database, []string{targetRole}, fn)
+}
+
+// WithRoleMemberships executes fn while ensuring the connecting user holds SET + INHERIT
+// membership in every non-empty role listed in targetRoles.
+//
+// Acquires `roleMu` once across all roles (preventing re-entrant mutex deadlocks when an
+// operation needs two roles simultaneously, such as `ALTER DATABASE ... OWNER TO` from an
+// existing owner to a new owner, or `REASSIGN OWNED BY old TO new`).
+//
+// On PostgreSQL 16+, preserves any pre-existing `ADMIN OPTION` row by revoking only the
+// temporary `SET` / `INHERIT` options added during the call.
+func (c *Client) WithRoleMemberships(ctx context.Context, database string, targetRoles []string, fn func(pool *pgxpool.Pool) error) error {
 	pool, err := c.Pool(ctx, database)
 	if err != nil {
 		return err
 	}
 
-	if targetRole == "" || !c.cfg.AutoGrantRoleMembership {
+	if !c.cfg.AutoGrantRoleMembership {
 		return fn(pool)
 	}
 
@@ -44,7 +54,22 @@ func (c *Client) WithRoleMembership(ctx context.Context, database, targetRole st
 		return err
 	}
 
-	if caps.IsSuperuser || strings.EqualFold(targetRole, caps.CurrentUser) {
+	if caps.IsSuperuser {
+		return fn(pool)
+	}
+
+	// Deduplicate roles and filter out empty / current user.
+	seen := make(map[string]bool, len(targetRoles))
+	var roles []string
+	for _, r := range targetRoles {
+		r = strings.TrimSpace(r)
+		if r == "" || strings.EqualFold(r, caps.CurrentUser) || seen[strings.ToLower(r)] {
+			continue
+		}
+		seen[strings.ToLower(r)] = true
+		roles = append(roles, r)
+	}
+	if len(roles) == 0 {
 		return fn(pool)
 	}
 
@@ -52,86 +77,103 @@ func (c *Client) WithRoleMembership(ctx context.Context, database, targetRole st
 	c.roleMu.Lock()
 	defer c.roleMu.Unlock()
 
-	var (
+	type grantRecord struct {
+		role         string
 		hasDirectRow bool
 		hasSetOption bool
 		hasInherit   bool
-	)
+	}
+	var granted []grantRecord
 
-	if caps.VersionNum >= 160000 {
-		err = pool.QueryRow(ctx, `
-			SELECT
-				COUNT(*) > 0,
-				COALESCE(bool_or(m.set_option), false),
-				COALESCE(bool_or(m.inherit_option), false)
-			FROM pg_auth_members m
-			JOIN pg_roles r ON r.oid = m.roleid
-			JOIN pg_roles mem ON mem.oid = m.member
-			WHERE r.rolname = $1 AND mem.rolname = $2
-		`, targetRole, caps.CurrentUser).Scan(&hasDirectRow, &hasSetOption, &hasInherit)
-	} else {
-		err = pool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1
+	for _, targetRole := range roles {
+		var (
+			hasDirectRow bool
+			hasSetOption bool
+			hasInherit   bool
+		)
+
+		if caps.VersionNum >= 160000 {
+			err = pool.QueryRow(ctx, `
+				SELECT
+					COUNT(*) > 0,
+					COALESCE(bool_or(m.set_option), false),
+					COALESCE(bool_or(m.inherit_option), false)
 				FROM pg_auth_members m
 				JOIN pg_roles r ON r.oid = m.roleid
 				JOIN pg_roles mem ON mem.oid = m.member
 				WHERE r.rolname = $1 AND mem.rolname = $2
-			)
-		`, targetRole, caps.CurrentUser).Scan(&hasDirectRow)
-		hasSetOption = hasDirectRow
-		hasInherit = hasDirectRow
-	}
-	if err != nil {
-		return fmt.Errorf("failed to check membership of %q in %q: %w", caps.CurrentUser, targetRole, err)
-	}
+			`, targetRole, caps.CurrentUser).Scan(&hasDirectRow, &hasSetOption, &hasInherit)
+		} else {
+			err = pool.QueryRow(ctx, `
+				SELECT EXISTS (
+					SELECT 1
+					FROM pg_auth_members m
+					JOIN pg_roles r ON r.oid = m.roleid
+					JOIN pg_roles mem ON mem.oid = m.member
+					WHERE r.rolname = $1 AND mem.rolname = $2
+				)
+			`, targetRole, caps.CurrentUser).Scan(&hasDirectRow)
+			hasSetOption = hasDirectRow
+			hasInherit = hasDirectRow
+		}
+		if err != nil {
+			// Best-effort cleanup of anything already granted before returning.
+			for i := len(granted) - 1; i >= 0; i-- {
+				revokeTempRole(pool, caps, granted[i].role, granted[i].hasDirectRow, granted[i].hasSetOption, granted[i].hasInherit)
+			}
+			return fmt.Errorf("failed to check membership of %q in %q: %w", caps.CurrentUser, targetRole, err)
+		}
 
-	granted := false
-	if !hasSetOption || !hasInherit {
-		grantSQL := fmt.Sprintf("GRANT %s TO %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser))
-		if caps.VersionNum >= 160000 {
-			grantSQL = fmt.Sprintf("GRANT %s TO %s WITH SET TRUE, INHERIT TRUE", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser))
+		if !hasSetOption || !hasInherit {
+			grantSQL := fmt.Sprintf("GRANT %s TO %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser))
+			if caps.VersionNum >= 160000 {
+				grantSQL = fmt.Sprintf("GRANT %s TO %s WITH SET TRUE, INHERIT TRUE", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser))
+			}
+			if grantErr := RetryTransient(ctx, func() error {
+				_, execErr := pool.Exec(ctx, grantSQL)
+				return execErr
+			}); grantErr == nil {
+				granted = append(granted, grantRecord{
+					role:         targetRole,
+					hasDirectRow: hasDirectRow,
+					hasSetOption: hasSetOption,
+					hasInherit:   hasInherit,
+				})
+			}
 		}
-		if err := RetryTransient(ctx, func() error {
-			_, execErr := pool.Exec(ctx, grantSQL)
-			return execErr
-		}); err != nil {
-			// If we couldn't grant (e.g., non-CREATEROLE user who already has indirect rights),
-			// attempt fn anyway and let PostgreSQL report the exact permission error if it fails.
-			return fn(pool)
-		}
-		granted = true
 	}
 
 	defer func() {
-		if !granted {
-			return
+		for i := len(granted) - 1; i >= 0; i-- {
+			g := granted[i]
+			revokeTempRole(pool, caps, g.role, g.hasDirectRow, g.hasSetOption, g.hasInherit)
 		}
-		if caps.VersionNum >= 160000 && hasDirectRow {
-			// Preserve the pre-existing PG 16+ ADMIN OPTION membership row; only revoke the
-			// temporary SET / INHERIT options we added.
-			if !hasSetOption {
-				_ = RetryTransient(context.Background(), func() error {
-					_, execErr := pool.Exec(context.Background(), fmt.Sprintf("REVOKE SET OPTION FOR %s FROM %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser)))
-					return execErr
-				})
-			}
-			if !hasInherit {
-				_ = RetryTransient(context.Background(), func() error {
-					_, execErr := pool.Exec(context.Background(), fmt.Sprintf("REVOKE INHERIT OPTION FOR %s FROM %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser)))
-					return execErr
-				})
-			}
-			return
-		}
-		revokeSQL := fmt.Sprintf("REVOKE %s FROM %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser))
-		_ = RetryTransient(context.Background(), func() error {
-			_, execErr := pool.Exec(context.Background(), revokeSQL)
-			return execErr
-		})
 	}()
 
 	return fn(pool)
+}
+
+func revokeTempRole(pool *pgxpool.Pool, caps ServerCapabilities, targetRole string, hasDirectRow, hasSetOption, hasInherit bool) {
+	if caps.VersionNum >= 160000 && hasDirectRow {
+		if !hasSetOption {
+			_ = RetryTransient(context.Background(), func() error {
+				_, execErr := pool.Exec(context.Background(), fmt.Sprintf("REVOKE SET OPTION FOR %s FROM %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser)))
+				return execErr
+			})
+		}
+		if !hasInherit {
+			_ = RetryTransient(context.Background(), func() error {
+				_, execErr := pool.Exec(context.Background(), fmt.Sprintf("REVOKE INHERIT OPTION FOR %s FROM %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser)))
+				return execErr
+			})
+		}
+		return
+	}
+	revokeSQL := fmt.Sprintf("REVOKE %s FROM %s", QuoteIdent(targetRole), QuoteIdent(caps.CurrentUser))
+	_ = RetryTransient(context.Background(), func() error {
+		_, execErr := pool.Exec(context.Background(), revokeSQL)
+		return execErr
+	})
 }
 
 // WithDatabaseOwnerMembership looks up the owner of `database` and runs fn inside
@@ -282,12 +324,10 @@ func (c *Client) DropRoleWithCleanup(ctx context.Context, roleName string, reass
 	}
 
 	if reassignTo != "" {
-		err = c.WithRoleMembership(ctx, c.cfg.Database, roleName, func(p *pgxpool.Pool) error {
-			return c.WithRoleMembership(ctx, c.cfg.Database, reassignTo, func(p2 *pgxpool.Pool) error {
-				sql := fmt.Sprintf("REASSIGN OWNED BY %s TO %s", QuoteIdent(roleName), QuoteIdent(reassignTo))
-				_, execErr := p2.Exec(ctx, sql)
-				return execErr
-			})
+		err = c.WithRoleMemberships(ctx, c.cfg.Database, []string{roleName, reassignTo}, func(p *pgxpool.Pool) error {
+			sql := fmt.Sprintf("REASSIGN OWNED BY %s TO %s", QuoteIdent(roleName), QuoteIdent(reassignTo))
+			_, execErr := p.Exec(ctx, sql)
+			return execErr
 		})
 		if err != nil {
 			return fmt.Errorf("failed to REASSIGN OWNED BY %q TO %q: %w", roleName, reassignTo, err)

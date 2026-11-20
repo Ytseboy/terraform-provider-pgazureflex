@@ -17,6 +17,7 @@ PG_MODULE_MAGIC;
 void _PG_init(void);
 
 static char *azure_extensions_guc = NULL;
+static char *pgaudit_log_guc = NULL;
 
 static void
 pgaadauth_object_relabel(const ObjectAddress *object, const char *seclabel)
@@ -47,6 +48,19 @@ _PG_init(void)
         &azure_extensions_guc,
         "PGCRYPTO,UUID-OSSP,VECTOR",
         PGC_SIGHUP,
+        0,
+        NULL,
+        NULL,
+        NULL
+    );
+
+    DefineCustomStringVariable(
+        "pgaudit.log",
+        "Simulated pgaudit.log GUC for testing dot-qualified role-in-database parameters.",
+        NULL,
+        &pgaudit_log_guc,
+        "none",
+        PGC_USERSET,
         0,
         NULL,
         NULL,

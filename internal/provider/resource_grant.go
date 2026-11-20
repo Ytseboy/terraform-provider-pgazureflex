@@ -40,6 +40,7 @@ type grantModel struct {
 	Objects         types.Set    `tfsdk:"objects"`
 	Privileges      types.Set    `tfsdk:"privileges"`
 	WithGrantOption types.Bool   `tfsdk:"with_grant_option"`
+	Authoritative   types.Bool   `tfsdk:"authoritative"`
 }
 
 func NewGrantResource() resource.Resource {
@@ -93,13 +94,19 @@ func (r *GrantResource) Schema(_ context.Context, _ resource.SchemaRequest, resp
 			"privileges": schema.SetAttribute{
 				Required:            true,
 				ElementType:         types.StringType,
-				MarkdownDescription: "Set of PostgreSQL privileges to grant (e.g. `[\"SELECT\", \"INSERT\"]`, `[\"USAGE\"]`, `[\"CONNECT\"]`, or `[\"ALL\"]`).",
+				MarkdownDescription: "Set of PostgreSQL privileges to grant (e.g. `[\"SELECT\", \"INSERT\"]`, `[\"USAGE\"]`, `[\"CONNECT\"]`, or `[\"ALL\"]`). Pass `[]` (empty set) to explicitly `REVOKE ALL PRIVILEGES` (ideal for hardening `role = \"PUBLIC\"` on databases or the `public` schema).",
 			},
 			"with_grant_option": schema.BoolAttribute{
 				Optional:            true,
 				Computed:            true,
 				Default:             booldefault.StaticBool(false),
 				MarkdownDescription: "Whether the grantee may re-grant these privileges to others (`WITH GRANT OPTION`).",
+			},
+			"authoritative": schema.BoolAttribute{
+				Optional:            true,
+				Computed:            true,
+				Default:             booldefault.StaticBool(false),
+				MarkdownDescription: "When `true`, revokes any privileges for `object_type` that are not listed in `privileges` (e.g. setting `role = \"PUBLIC\"`, `object_type = \"schema\"`, `schema = \"public\"`, `privileges = [\"USAGE\"]`, `authoritative = true` revokes `CREATE` while keeping `USAGE`). Automatically implied when `privileges = []`.",
 			},
 		},
 	}
@@ -246,12 +253,10 @@ func (r *GrantResource) Delete(ctx context.Context, req resource.DeleteRequest, 
 
 func (r *GrantResource) applyGrant(ctx context.Context, m *grantModel, diags *diag.Diagnostics) error {
 	db := m.Database.ValueString()
+	objType := m.ObjectType.ValueString()
 
-	privs := pgclient.NormalizePrivileges(m.ObjectType.ValueString(), setToStringSlice(ctx, m.Privileges, diags))
+	privs := pgclient.NormalizePrivileges(objType, setToStringSlice(ctx, m.Privileges, diags))
 	if diags.HasError() {
-		return nil
-	}
-	if len(privs) == 0 {
 		return nil
 	}
 
@@ -260,18 +265,50 @@ func (r *GrantResource) applyGrant(ctx context.Context, m *grantModel, diags *di
 		return nil
 	}
 
-	targetClause, err := buildGrantTargetClause(db, m.ObjectType.ValueString(), m.Schema.ValueString(), objects)
+	targetClause, err := buildGrantTargetClause(db, objType, m.Schema.ValueString(), objects)
 	if err != nil {
 		return err
 	}
 
 	grantee := formatGrantee(m.Role.ValueString())
-	sql := fmt.Sprintf("GRANT %s ON %s TO %s", strings.Join(privs, ", "), targetClause, grantee)
-	if m.WithGrantOption.ValueBool() {
-		sql += " WITH GRANT OPTION"
-	}
 
 	return r.client.WithDatabaseOwnerMembership(ctx, db, func(pool *pgxpool.Pool) error {
+		// Empty privilege set: authoritatively REVOKE ALL PRIVILEGES (e.g. hardening PUBLIC).
+		if len(privs) == 0 {
+			revokeSQL := fmt.Sprintf("REVOKE ALL PRIVILEGES ON %s FROM %s", targetClause, grantee)
+			return pgclient.RetryTransient(ctx, func() error {
+				_, execErr := pool.Exec(ctx, revokeSQL)
+				return execErr
+			})
+		}
+
+		// Authoritative mode: revoke any valid privilege for object_type not in desired privs.
+		if m.Authoritative.ValueBool() {
+			desiredSet := make(map[string]bool, len(privs))
+			for _, p := range privs {
+				desiredSet[p] = true
+			}
+			var toRevoke []string
+			for _, vp := range pgclient.ValidPrivilegesByObjectType[objType] {
+				if !desiredSet[vp] {
+					toRevoke = append(toRevoke, vp)
+				}
+			}
+			if len(toRevoke) > 0 {
+				revokeSQL := fmt.Sprintf("REVOKE %s ON %s FROM %s", strings.Join(toRevoke, ", "), targetClause, grantee)
+				if err := pgclient.RetryTransient(ctx, func() error {
+					_, execErr := pool.Exec(ctx, revokeSQL)
+					return execErr
+				}); err != nil {
+					return err
+				}
+			}
+		}
+
+		sql := fmt.Sprintf("GRANT %s ON %s TO %s", strings.Join(privs, ", "), targetClause, grantee)
+		if m.WithGrantOption.ValueBool() {
+			sql += " WITH GRANT OPTION"
+		}
 		return pgclient.RetryTransient(ctx, func() error {
 			_, execErr := pool.Exec(ctx, sql)
 			return execErr

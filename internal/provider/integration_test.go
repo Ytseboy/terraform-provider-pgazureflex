@@ -35,7 +35,9 @@ func TestProviderSchemaAndRegistration(t *testing.T) {
 
 	expectedResources := []string{
 		"pgazureflex_database",
+		"pgazureflex_database_config",
 		"pgazureflex_role",
+		"pgazureflex_role_database_parameters",
 		"pgazureflex_entra_role",
 		"pgazureflex_entra_role_mapping",
 		"pgazureflex_role_membership",
